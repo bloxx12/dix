@@ -5,9 +5,12 @@ use derive_more::{
   DerefMut,
   Display,
   From,
+  FromStr,
 };
 
-#[derive(Deref, DerefMut, Display, Debug, Clone, PartialEq, Eq, From)]
+#[derive(
+  Deref, DerefMut, Display, Debug, Clone, PartialEq, Eq, From, FromStr,
+)]
 pub struct Version(String);
 
 impl PartialOrd for Version {
@@ -22,6 +25,12 @@ impl cmp::Ord for Version {
     let that = VersionComponentIter::from(&***that).filter_map(Result::ok);
 
     this.cmp(that)
+  }
+}
+
+impl From<&str> for Version {
+  fn from(s: &str) -> Self {
+    Self(s.to_owned())
   }
 }
 

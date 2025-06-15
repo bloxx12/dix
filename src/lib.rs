@@ -24,6 +24,8 @@ mod store;
 mod version;
 use version::Version;
 
+#[cfg(test)] mod tests;
+
 #[derive(Deref, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct DerivationId(i64);
 

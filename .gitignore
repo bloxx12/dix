@@ -1,3 +1,5 @@
 /.direnv
 /target
 /result
+/mutants.out
+/mutants.out.old

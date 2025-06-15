@@ -38,20 +38,20 @@ use crate::{
 };
 
 #[derive(Debug, Default)]
-struct Diff<T> {
-  old: T,
-  new: T,
+pub struct Diff<T> {
+  pub old: T,
+  pub new: T,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Change {
+pub enum Change {
   UpgradeDowngrade,
   Upgraded,
   Downgraded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DiffStatus {
+pub enum DiffStatus {
   Changed(Change),
   Added,
   Removed,
@@ -77,7 +77,7 @@ impl PartialOrd for DiffStatus {
 
 impl cmp::Ord for DiffStatus {
   fn cmp(&self, other: &Self) -> cmp::Ordering {
-    #[expect(unreachable_patterns)]
+    #[expect(unreachable_patterns, clippy::match_same_arms)]
     match (*self, *other) {
       (Self::Changed(_), Self::Changed(_)) => cmp::Ordering::Equal,
       (Self::Changed(_), _) => cmp::Ordering::Less,
@@ -231,7 +231,7 @@ pub fn write_paths_diffln(
 /// deduplicate_versions(&mut versions);
 /// assert_eq!(*versions, &["1.0 ×2", "2.3 ×3", "4.8"]);
 /// ```
-fn deduplicate_versions(versions: &mut Vec<Version>) {
+pub fn deduplicate_versions(versions: &mut Vec<Version>) {
   versions.sort_unstable();
 
   let mut deduplicated = Vec::new();
@@ -271,7 +271,6 @@ fn deduplicate_versions(versions: &mut Vec<Version>) {
   *versions = deduplicated;
 }
 
-#[expect(clippy::cognitive_complexity, clippy::too_many_lines)]
 fn write_packages_diffln(
   writer: &mut impl fmt::Write,
   paths_old: impl Iterator<Item = StorePath>,
@@ -282,66 +281,15 @@ fn write_packages_diffln(
   let mut paths = HashMap::<String, Diff<Vec<Version>>>::new();
 
   // Collect the names of old and new paths.
-  let system_derivations_old: HashSet<String> = system_paths_old
-    .filter_map(|path| {
-      match path.parse_name_and_version() {
-        Ok((name, _)) => Some(name.into()),
-        Err(error) => {
-          log::warn!("error parsing old system path name and version: {error}");
-          None
-        },
-      }
-    })
-    .collect();
-
-  let system_derivations_new: HashSet<String> = system_paths_new
-    .filter_map(|path| {
-      match path.parse_name_and_version() {
-        Ok((name, _)) => Some(name.into()),
-        Err(error) => {
-          log::warn!("error parsing new system path name and version: {error}");
-          None
-        },
-      }
-    })
-    .collect();
+  let system_derivations_old = get_system_derivations(system_paths_old);
+  let system_derivations_new = get_system_derivations(system_paths_new);
 
   for path in paths_old {
-    match path.parse_name_and_version() {
-      Ok((name, version)) => {
-        log::debug!("parsed name: {name}");
-        log::debug!("parsed version: {version:?}");
-
-        paths
-          .entry(name.into())
-          .or_default()
-          .old
-          .push(version.unwrap_or_else(|| Version::from("<none>".to_owned())));
-      },
-
-      Err(error) => {
-        log::warn!("error parsing old path name and version: {error}");
-      },
-    }
+    push_parsed_name_and_version_old(&path, &mut paths);
   }
 
   for path in paths_new {
-    match path.parse_name_and_version() {
-      Ok((name, version)) => {
-        log::debug!("parsed name: {name}");
-        log::debug!("parsed version: {version:?}");
-
-        paths
-          .entry(name.into())
-          .or_default()
-          .new
-          .push(version.unwrap_or_else(|| Version::from("<none>".to_owned())));
-      },
-
-      Err(error) => {
-        log::warn!("error parsing new path name and version: {error}");
-      },
-    }
+    push_parsed_name_and_version_new(&path, &mut paths);
   }
 
   let mut diffs = paths
@@ -350,51 +298,14 @@ fn write_packages_diffln(
       deduplicate_versions(&mut versions.old);
       deduplicate_versions(&mut versions.new);
 
-      let status = match (versions.old.len(), versions.new.len()) {
-        (0, 0) => unreachable!(),
-        (0, _) => DiffStatus::Added,
-        (_, 0) => DiffStatus::Removed,
-        _ => {
-          let mut saw_upgrade = false;
-          let mut saw_downgrade = false;
-
-          for diff in
-            Itertools::zip_longest(versions.old.iter(), versions.new.iter())
-          {
-            match diff {
-              EitherOrBoth::Left(_) => saw_downgrade = true,
-              EitherOrBoth::Right(_) => saw_upgrade = true,
-
-              EitherOrBoth::Both(old, new) => {
-                match old.cmp(new) {
-                  cmp::Ordering::Less => saw_upgrade = true,
-                  cmp::Ordering::Greater => saw_downgrade = true,
-                  cmp::Ordering::Equal => {},
-                }
-
-                if saw_upgrade && saw_downgrade {
-                  break;
-                }
-              },
-            }
-          }
-
-          DiffStatus::Changed(match (saw_upgrade, saw_downgrade) {
-            (true, true) => Change::UpgradeDowngrade,
-            (true, false) => Change::Upgraded,
-            (false, true) => Change::Downgraded,
-            _ => return None,
-          })
-        },
-      };
-
       let selection = DerivationSelectionStatus::from_names(
         &name,
         &system_derivations_old,
         &system_derivations_new,
       );
 
-      Some((name, versions, status, selection))
+      get_status_from_versions(&versions)
+        .map(|status| (name, versions, status, selection))
     })
     .collect::<Vec<_>>();
 
@@ -440,143 +351,20 @@ fn write_packages_diffln(
 
     write!(writer, "[{status}{selection}] {name:<name_width$}")?;
 
-    let mut oldacc = String::new();
-    let mut oldwrote = false;
-    let mut newacc = String::new();
-    let mut newwrote = false;
+    if let Ok((oldacc, newacc)) = collect_diffs(versions) {
+      let oldacc = oldacc.join(", ");
+      let newacc = newacc.join(", ");
 
-    for diff in Itertools::zip_longest(versions.old.iter(), versions.new.iter())
-    {
-      match diff {
-        EitherOrBoth::Left(old_version) => {
-          if oldwrote {
-            write!(oldacc, ", ")?;
-          } else {
-            write!(oldacc, " ")?;
-            oldwrote = true;
-          }
-
-          for old_comp in old_version {
-            match old_comp {
-              Ok(old_comp) => write!(oldacc, "{old}", old = old_comp.red())?,
-              Err(ignored) => write!(oldacc, "{ignored}")?,
-            }
-          }
-        },
-
-        EitherOrBoth::Right(new_version) => {
-          if newwrote {
-            write!(newacc, ", ")?;
-          } else {
-            write!(newacc, " ")?;
-            newwrote = true;
-          }
-
-          for new_comp in new_version {
-            match new_comp {
-              Ok(new_comp) => write!(newacc, "{new}", new = new_comp.green())?,
-              Err(ignored) => write!(newacc, "{ignored}")?,
-            }
-          }
-        },
-
-        EitherOrBoth::Both(old_version, new_version) => {
-          if old_version == new_version {
-            continue;
-          }
-
-          if oldwrote {
-            write!(oldacc, ", ")?;
-          } else {
-            write!(oldacc, " ")?;
-            oldwrote = true;
-          }
-          if newwrote {
-            write!(newacc, ", ")?;
-          } else {
-            write!(newacc, " ")?;
-            newwrote = true;
-          }
-
-          for diff in Itertools::zip_longest(
-            old_version.into_iter(),
-            new_version.into_iter(),
-          ) {
-            match diff {
-              EitherOrBoth::Left(old_comp) => {
-                match old_comp {
-                  Ok(old_comp) => {
-                    write!(oldacc, "{old}", old = old_comp.red())?;
-                  },
-                  Err(ignored) => {
-                    write!(oldacc, "{ignored}")?;
-                  },
-                }
-              },
-
-              EitherOrBoth::Right(new_comp) => {
-                match new_comp {
-                  Ok(new_comp) => {
-                    write!(newacc, "{new}", new = new_comp.green())?;
-                  },
-                  Err(ignored) => {
-                    write!(newacc, "{ignored}")?;
-                  },
-                }
-              },
-
-              EitherOrBoth::Both(old_comp, new_comp) => {
-                match (old_comp, new_comp) {
-                  (Ok(old_comp), Ok(new_comp)) => {
-                    for char in diff::chars(*old_comp, *new_comp) {
-                      match char {
-                        diff::Result::Left(old_part) => {
-                          write!(oldacc, "{old}", old = old_part.red())?;
-                        },
-                        diff::Result::Right(new_part) => {
-                          write!(newacc, "{new}", new = new_part.green())?;
-                        },
-
-                        diff::Result::Both(old_part, new_part) => {
-                          write!(oldacc, "{old}", old = old_part.yellow())?;
-                          write!(newacc, "{new}", new = new_part.yellow())?;
-                        },
-                      }
-                    }
-                  },
-
-                  (old_comp, new_comp) => {
-                    match old_comp {
-                      Ok(old_comp) => {
-                        write!(oldacc, "{old}", old = old_comp.yellow())?;
-                      },
-                      Err(old_comp) => write!(oldacc, "{old_comp}")?,
-                    }
-
-                    match new_comp {
-                      Ok(new_comp) => {
-                        write!(newacc, "{new}", new = new_comp.yellow())?;
-                      },
-                      Err(new_comp) => write!(newacc, "{new_comp}")?,
-                    }
-                  },
-                }
-              },
-            }
-          }
-        },
-      }
+      write!(
+        writer,
+        "{oldacc}{arrow}{newacc}",
+        arrow = if !oldacc.is_empty() && !newacc.is_empty() {
+          " -> "
+        } else {
+          ""
+        }
+      )?;
     }
-
-    write!(
-      writer,
-      "{oldacc}{arrow}{newacc}",
-      arrow = if !oldacc.is_empty() && !newacc.is_empty() {
-        " ->"
-      } else {
-        ""
-      }
-    )?;
 
     writeln!(writer)?;
   }
@@ -636,4 +424,218 @@ pub fn write_size_diffln(
       size_diff.red()
     },
   )
+}
+
+pub fn get_system_derivations(
+  system_paths: impl Iterator<Item = StorePath>,
+) -> HashSet<String> {
+  system_paths
+    .filter_map(|path| {
+      match path.parse_name_and_version() {
+        Ok((name, _)) => Some(name.into()),
+        Err(error) => {
+          log::warn!("error parsing system path name and version: {error}");
+          None
+        },
+      }
+    })
+    .collect()
+}
+
+pub fn push_parsed_name_and_version_old(
+  path: &StorePath,
+  paths: &mut HashMap<String, Diff<Vec<Version>>>,
+) {
+  match path.parse_name_and_version() {
+    Ok((name, version)) => {
+      log::debug!("parsed name: {name}");
+      log::debug!("parsed version: {version:?}");
+
+      paths
+        .entry(name.into())
+        .or_default()
+        .old
+        .push(version.unwrap_or_else(|| Version::from("<none>".to_owned())));
+    },
+
+    Err(error) => {
+      log::warn!("error parsing path name and version: {error}");
+    },
+  }
+}
+
+pub fn push_parsed_name_and_version_new(
+  path: &StorePath,
+  paths: &mut HashMap<String, Diff<Vec<Version>>>,
+) {
+  match path.parse_name_and_version() {
+    Ok((name, version)) => {
+      log::debug!("parsed name: {name}");
+      log::debug!("parsed version: {version:?}");
+
+      paths
+        .entry(name.into())
+        .or_default()
+        .new
+        .push(version.unwrap_or_else(|| Version::from("<none>".to_owned())));
+    },
+
+    Err(error) => {
+      log::warn!("error parsing path name and version: {error}");
+    },
+  }
+}
+
+pub fn get_status_from_versions(
+  versions: &Diff<Vec<Version>>,
+) -> Option<DiffStatus> {
+  let result = match (versions.old.len(), versions.new.len()) {
+    (0, 0) => unreachable!(),
+    (0, _) => DiffStatus::Added,
+    (_, 0) => DiffStatus::Removed,
+    _ => {
+      let mut saw_upgrade = false;
+      let mut saw_downgrade = false;
+
+      for diff in
+        Itertools::zip_longest(versions.old.iter(), versions.new.iter())
+      {
+        match diff {
+          EitherOrBoth::Left(_) => saw_downgrade = true,
+          EitherOrBoth::Right(_) => saw_upgrade = true,
+
+          EitherOrBoth::Both(old, new) => {
+            match old.cmp(new) {
+              cmp::Ordering::Less => saw_upgrade = true,
+              cmp::Ordering::Greater => saw_downgrade = true,
+              cmp::Ordering::Equal => {},
+            }
+
+            if saw_upgrade && saw_downgrade {
+              break;
+            }
+          },
+        }
+      }
+
+      DiffStatus::Changed(match (saw_upgrade, saw_downgrade) {
+        (true, true) => Change::UpgradeDowngrade,
+        (true, false) => Change::Upgraded,
+        (false, true) => Change::Downgraded,
+        // FIXME: This is borked
+        _ => return None,
+      })
+    },
+  };
+  Some(result)
+}
+
+pub fn collect_diffs(
+  versions: &Diff<Vec<Version>>,
+) -> Result<(Vec<String>, Vec<String>), fmt::Error> {
+  let mut old_versions = Vec::<String>::new();
+  let mut new_versions = Vec::<String>::new();
+
+  for diff in Itertools::zip_longest(versions.old.iter(), versions.new.iter()) {
+    match diff {
+      EitherOrBoth::Left(old_version) => {
+        let mut acc = String::new();
+
+        for old_comp in old_version {
+          match old_comp {
+            Ok(old_comp) => write!(acc, "{old}", old = old_comp.red())?,
+            Err(ignored) => write!(acc, "{ignored}")?,
+          }
+        }
+        old_versions.push(acc);
+      },
+
+      EitherOrBoth::Right(new_version) => {
+        let mut acc = String::new();
+
+        for new_comp in new_version {
+          match new_comp {
+            Ok(new_comp) => write!(acc, "{new}", new = new_comp.red())?,
+            Err(ignored) => write!(acc, "{ignored}")?,
+          }
+        }
+        old_versions.push(acc);
+      },
+
+      EitherOrBoth::Both(old_version, new_version) => {
+        if old_version == new_version {
+          continue;
+        }
+        let mut oldacc = String::new();
+        let mut newacc = String::new();
+
+        for diff in Itertools::zip_longest(
+          old_version.into_iter(),
+          new_version.into_iter(),
+        ) {
+          match diff {
+            EitherOrBoth::Left(old_comp) => {
+              match old_comp {
+                Ok(old_comp) => write!(oldacc, "{old}", old = old_comp.red())?,
+                Err(ignored) => write!(oldacc, "{ignored}")?,
+              }
+            },
+
+            EitherOrBoth::Right(new_comp) => {
+              match new_comp {
+                Ok(new_comp) => {
+                  write!(newacc, "{new}", new = new_comp.green())?;
+                },
+                Err(ignored) => write!(newacc, "{ignored}")?,
+              }
+            },
+
+            EitherOrBoth::Both(old_comp, new_comp) => {
+              match (old_comp, new_comp) {
+                (Ok(old_comp), Ok(new_comp)) => {
+                  for char in diff::chars(*old_comp, *new_comp) {
+                    match char {
+                      diff::Result::Left(old_part) => {
+                        write!(oldacc, "{old}", old = old_part.red())?;
+                      },
+                      diff::Result::Right(new_part) => {
+                        write!(newacc, "{new}", new = new_part.green())?;
+                      },
+
+                      diff::Result::Both(old_part, new_part) => {
+                        write!(oldacc, "{old}", old = old_part.yellow())?;
+                        write!(newacc, "{new}", new = new_part.yellow())?;
+                      },
+                    }
+                  }
+                },
+
+                (old_comp, new_comp) => {
+                  match old_comp {
+                    Ok(old_comp) => {
+                      write!(oldacc, "{old}", old = old_comp.yellow())?;
+                    },
+
+                    Err(old_comp) => write!(oldacc, "{old_comp}")?,
+                  }
+
+                  match new_comp {
+                    Ok(new_comp) => {
+                      write!(newacc, "{new}", new = new_comp.yellow())?;
+                    },
+
+                    Err(new_comp) => write!(newacc, "{new_comp}")?,
+                  }
+                },
+              }
+            },
+          }
+        }
+        old_versions.push(oldacc);
+        new_versions.push(newacc);
+      },
+    }
+  }
+
+  Ok((old_versions, new_versions))
 }
